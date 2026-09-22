@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 密钥与本地配置
+.env
+sk-*
+DEEPSEEK_API_KEY=*
+*API_KEY*
+
+# 本地数据库
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Streamlit
+.streamlit/secrets.toml
