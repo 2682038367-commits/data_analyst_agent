@@ -18,9 +18,12 @@ class AgentState(TypedDict, total=False):
     schema: str
     tables: List[str]
 
-    # SQL 生成 / 校验 / 执行
+    # SQL 生成 / 审查 / 执行
     sql_query: str
-    sql_error: Optional[str]
+    # 修复反馈：语义审查问题 / 执行错误 / 结果异常，统一作为「回炉重造」的信号
+    feedback: Optional[str]
+    # 审查/质检发现的问题清单（供展示）
+    review_issues: Optional[List[str]]
     query_result: Optional[List[Dict[str, Any]]]
     columns: Optional[List[str]]
     retry_count: int
@@ -39,7 +42,8 @@ def default_state(question: str = "") -> AgentState:
         schema="",
         tables=[],
         sql_query="",
-        sql_error=None,
+        feedback=None,
+        review_issues=None,
         query_result=None,
         columns=None,
         retry_count=0,

@@ -2,26 +2,43 @@
 
 基于 **LangGraph** 的中文 Text-to-SQL 智能体：把自然语言问题转成 SQL、执行查询、用自然语言分析结果并自动生成图表。
 
+核心亮点：**不止检查 SQL 语法，更检查业务语义** —— 重点解决「SQL 能跑通，但业务答案错误」的问题（例如统计「用户数」时该用 `COUNT(DISTINCT user_id)` 却写成了 `COUNT(user_id)`）。
+
 ## 核心工作流
 
 ```
-用户问题 → 意图识别 → Schema检索 → SQL生成 → SQL检查
-              │                                  │
-              └────(非数据问题→直接回答)          ▼
-                                              执行
-                                          ┌─────┴──────┐
-                                       失败→修复→重新生成  成功→分析
-                                          │                │
-                                          └──(重试耗尽→报错)  可视化 → 回答
+用户问题 → 意图识别 → Schema检索 → SQL生成 → SQL审查(SQL Reviewer) → 执行
+                                                       │
+                                     (非数据问题→直接回答)│
+                                                       ▼
+                                              ┌─ 审查不过 → 修复 → 重新生成 ─┐
+                                              │                            │
+                                              ▼                            │
+                                            执行成功 → 结果质检             │
+                                              │                            │
+                                        ┌─ 结果异常 → 修复 → 重新生成 ──────┘
+                                        │   (重试耗尽 → 报错兜底)
+                                        ▼
+                                       正常 → 分析 → 可视化 → 回答
 ```
 
-对应 LangGraph 中的 11 个节点：`classify_intent` / `direct_answer` / `retrieve_schema` / `generate_sql` / `validate_sql` / `execute_sql` / `repair_sql` / `analyze` / `decide_chart` / `finalize` / `finalize_error`。
+SQL 审查分三层：
+
+1. **安全校验**（确定性）：只允许单条 `SELECT`，禁止写操作
+2. **编译校验**（确定性）：用 `EXPLAIN` 验证语法 / 表名 / 列名，不真正执行
+3. **语义审查**（LLM · SQL Reviewer）：检查 COUNT vs COUNT(DISTINCT)、JOIN 数据膨胀、聚合粒度、时间窗口、NULL 处理、分母定义、GROUP BY 遗漏等 9 类问题
+
+执行后还有一道 **结果质检**：成功执行不代表结果正确，会再次检查结果是否为空、数值量级是否异常、粒度是否与问题一致等。
+
+对应 LangGraph 中的 12 个节点：`classify_intent` / `direct_answer` / `retrieve_schema` / `generate_sql` / `review_sql` / `execute_sql` / `check_results` / `repair_sql` / `analyze` / `decide_chart` / `finalize` / `finalize_error`。
 
 ## 特性
 
 - ✅ 完整的 Agent workflow（不是把 prompt 一次性丢给 LLM）
-- ✅ SQL 安全校验：只允许单条 `SELECT`，禁止写操作
-- ✅ 执行失败自动携带错误信息重试（默认最多 3 次）
+- ✅ SQL 语义审查：执行前发现「COUNT 该去重却没用 DISTINCT」等业务口径错误
+- ✅ SQL 安全校验 + 编译校验：只允许单条 `SELECT`，表 / 列 / 语法错误确定性拦截
+- ✅ 执行结果质检：成功执行后再次校验结果合理性
+- ✅ 失败自动携带反馈重试（默认最多 3 次，可在 `.env` 调 `MAX_RETRIES`）
 - ✅ 自动选择图表类型（柱状 / 折线 / 饼图 / 散点），带启发式兜底
 - ✅ 内置 SQLite 电商示例数据，开箱即用
 - ✅ Streamlit 交互界面 + 命令行两种用法

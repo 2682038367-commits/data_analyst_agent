@@ -20,6 +20,11 @@ init_db()
 def render_result(result: Dict[str, Any], steps: List[str]) -> None:
     with st.expander("🔍 Agent 执行流程", expanded=False):
         st.write(" → ".join(steps))
+        issues = result.get("review_issues")
+        if issues:
+            st.markdown("**审查/质检发现的问题：**")
+            for i in issues:
+                st.markdown(f"- {i}")
 
     sql = result.get("sql_query")
     if sql:
@@ -64,7 +69,7 @@ with st.sidebar:
 # 主界面
 # ---------------------------------------------------------------------------
 st.title("🛢️ LangGraph SQL Agent")
-st.caption("用自然语言查询数据库，自动完成 意图识别 → Schema 检索 → SQL 生成 → 检查 → 执行 → 分析 → 可视化 → 回答")
+st.caption("用自然语言查询数据库，自动完成 意图识别 → Schema 检索 → SQL 生成 → SQL 语义审查 → 执行 → 结果质检 → 分析 → 可视化 → 回答")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
