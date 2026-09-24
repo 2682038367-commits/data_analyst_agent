@@ -25,27 +25,73 @@ def render_result(result: Dict[str, Any], steps: List[str]) -> None:
             st.markdown("**审查/质检发现的问题：**")
             for i in issues:
                 st.markdown(f"- {i}")
+        history = result.get("validation_history") or []
+        if history:
+            st.markdown("**Result Validator 回溯历史：**")
+            for attempt in history:
+                messages = "；".join(
+                    str(item.get("message", "未知异常"))
+                    for item in attempt.get("issues", [])
+                )
+                st.markdown(f"- 第 {attempt.get('retry', 0) + 1} 次结果：{messages}")
 
-    sql = result.get("sql_query")
-    if sql:
-        st.markdown("**🧩 生成的 SQL**")
-        st.code(sql, language="sql")
+    trace = result.get("analysis_trace") or []
+    if trace:
+        with st.expander("🧠 Analyzer 决策轨迹", expanded=False):
+            for decision in trace:
+                followup = decision.get("followup_question")
+                st.markdown(
+                    f"**第 {decision.get('round')} 轮**："
+                    f"{decision.get('rationale', '')}"
+                )
+                if followup:
+                    st.markdown(f"下一步查询：{followup}")
 
-    rows = result.get("query_result")
-    columns = result.get("columns")
-    if rows is not None and columns:
-        df = pd.DataFrame(rows, columns=columns)
-        st.markdown("**📋 查询结果**")
-        st.dataframe(df, use_container_width=True)
+    evidence = result.get("analysis_evidence") or []
+    display_rows = result.get("query_result")
+    display_columns = result.get("columns") or []
+    if evidence:
+        st.markdown("**🧭 自主分析证据链**")
+        for item in evidence:
+            with st.expander(
+                f"第 {item.get('round')} 轮：{item.get('question', '')}",
+                expanded=len(evidence) == 1,
+            ):
+                st.code(item.get("sql") or "", language="sql")
+                item_rows = item.get("rows") or []
+                item_columns = item.get("columns") or []
+                if item_rows and item_columns:
+                    st.dataframe(
+                        pd.DataFrame(item_rows, columns=item_columns),
+                        use_container_width=True,
+                    )
+                if item.get("truncated"):
+                    st.caption(f"仅展示前 {len(item_rows)} 行，共 {item.get('row_count')} 行")
+        display_rows = evidence[-1].get("rows") or []
+        display_columns = evidence[-1].get("columns") or []
+    else:
+        sql = result.get("sql_query")
+        if sql:
+            st.markdown("**🧩 生成的 SQL**")
+            st.code(sql, language="sql")
+        if display_rows is not None and display_columns:
+            st.markdown("**📋 查询结果**")
+            st.dataframe(
+                pd.DataFrame(display_rows, columns=display_columns),
+                use_container_width=True,
+            )
 
-        chart = result.get("chart")
-        if chart and chart.get("should_chart"):
-            try:
-                fig = build_figure(chart, df)
-                st.markdown("**📊 可视化**")
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as exc:  # noqa: BLE001
-                st.warning(f"图表生成失败：{exc}")
+    chart = result.get("chart")
+    if chart and chart.get("should_chart") and display_rows and display_columns:
+        try:
+            fig = build_figure(
+                chart,
+                pd.DataFrame(display_rows, columns=display_columns),
+            )
+            st.markdown("**📊 可视化**")
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"图表生成失败：{exc}")
 
     st.markdown("**💬 回答**")
     st.markdown(result.get("answer") or "(无回答)")
@@ -69,7 +115,7 @@ with st.sidebar:
 # 主界面
 # ---------------------------------------------------------------------------
 st.title("🛢️ LangGraph SQL Agent")
-st.caption("用自然语言查询数据库，自动完成 意图识别 → Schema 检索 → SQL 生成 → SQL 语义审查 → 执行 → 结果质检 → 分析 → 可视化 → 回答")
+st.caption("用自然语言查询数据库，自动完成 意图识别 → Schema 检索 → SQL 生成 → SQL 语义审查 → 执行 → 结果质检 → Analyzer 自主下钻 → 多轮归因 → 可视化 → 回答")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []

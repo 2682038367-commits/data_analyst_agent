@@ -15,5 +15,10 @@ data/*.db
 data/*.sqlite
 data/*.sqlite3
 
+# Evaluation 运行产物
+evals/results/*.jsonl
+evals/results/*.json
+evals/results/*.md
+
 # Streamlit
 .streamlit/secrets.toml
