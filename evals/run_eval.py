@@ -28,7 +28,9 @@ from langchain_core.messages import HumanMessage, SystemMessage  # noqa: E402
 
 from src import graph  # noqa: E402
 from src.config import (
-    EVAL_JUDGE_MODEL, LLM_MODEL, LLM_TEMPERATURE, MAX_ANALYSIS_DEPTH, MAX_RETRIES,
+    EVAL_JUDGE_MODEL, LLM_API_KEY, LLM_FALLBACK_API_KEY, LLM_FALLBACK_MODEL,
+    LLM_FALLBACK_PROVIDER, LLM_MODEL, LLM_PROVIDER, LLM_TEMPERATURE,
+    MAX_ANALYSIS_DEPTH, MAX_RETRIES,
 )  # noqa: E402
 from src.db import get_connection, init_db  # noqa: E402
 from src.evaluation import build_summary, load_benchmark, results_equivalent  # noqa: E402
@@ -232,6 +234,26 @@ def evaluate_case(
             candidate_columns,
         )
 
+    matched_sql = candidate_sql if semantic_correct else None
+    if mode == "full" and not semantic_correct:
+        for item in (result.get("analysis_evidence") or [])[1:]:
+            followup_sql = str(item.get("sql") or "")
+            safe, _ = graph.check_sql_safe(followup_sql)
+            if not safe:
+                continue
+            try:
+                followup_rows, followup_columns = _execute(followup_sql)
+            except Exception:  # noqa: BLE001
+                continue
+            equivalent, reason = results_equivalent(
+                gold_rows, gold_columns, followup_rows, followup_columns
+            )
+            if equivalent:
+                semantic_correct = True
+                semantic_reason = reason
+                matched_sql = followup_sql
+                break
+
     candidate_answer = str(result.get("answer") or "")
     answer_judgement = None
     if judge_answers:
@@ -257,6 +279,7 @@ def evaluate_case(
         "execution_success": execution_success,
         "semantic_correct": semantic_correct,
         "semantic_reason": semantic_reason,
+        "semantic_matched_sql": matched_sql,
         "answer_correct": (
             answer_judgement["correct"] if answer_judgement is not None else None
         ),
@@ -357,6 +380,11 @@ def build_manifest(
         "mode": mode,
         "answer_judge_enabled": judge_answers,
         "case_count": case_count,
+        "provider": LLM_PROVIDER,
+        "primary_key_configured": bool(LLM_API_KEY),
+        "fallback_provider": LLM_FALLBACK_PROVIDER or None,
+        "fallback_model": LLM_FALLBACK_MODEL or None,
+        "fallback_key_configured": bool(LLM_FALLBACK_API_KEY),
         "model": LLM_MODEL,
         "judge_model": EVAL_JUDGE_MODEL,
         "temperature": LLM_TEMPERATURE,

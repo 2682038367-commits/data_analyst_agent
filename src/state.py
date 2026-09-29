@@ -17,6 +17,9 @@ class AgentState(TypedDict, total=False):
     # schema 检索
     schema: str
     tables: List[str]
+    # 查询前分析计划及各步骤执行状态
+    initial_plan: Optional[Dict[str, Any]]
+    plan_steps: List[Dict[str, Any]]
 
     # SQL 生成 / 审查 / 执行
     sql_query: str
@@ -51,6 +54,8 @@ def default_state(question: str = "") -> AgentState:
         intent="",
         schema="",
         tables=[],
+        initial_plan=None,
+        plan_steps=[],
         sql_query="",
         feedback=None,
         review_issues=None,

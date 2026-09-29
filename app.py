@@ -6,7 +6,10 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
-from src.config import DB_PATH, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+from src.config import (
+    DB_PATH, LLM_API_KEY, LLM_AVAILABLE, LLM_BASE_URL, LLM_FALLBACK_API_KEY,
+    LLM_FALLBACK_MODEL, LLM_KEY_HINT, LLM_MODEL, LLM_PROVIDER,
+)
 from src.db import get_table_schema, init_db, list_tables
 from src.graph import run_agent
 from src.viz import build_figure
@@ -35,6 +38,31 @@ def render_result(result: Dict[str, Any], steps: List[str]) -> None:
                 )
                 st.markdown(f"- 第 {attempt.get('retry', 0) + 1} 次结果：{messages}")
 
+    initial_plan = result.get("initial_plan") or {}
+    if initial_plan:
+        labels = {
+            "metric_query": "指标查询",
+            "trend_analysis": "趋势分析",
+            "anomaly_diagnosis": "异常诊断",
+            "attribution_analysis": "归因分析",
+            "user_segmentation": "用户分群",
+            "funnel_retention": "漏斗 / 留存分析",
+        }
+        st.markdown(
+            "**🧭 分析计划** · "
+            + labels.get(initial_plan.get("question_type"), "指标查询")
+        )
+        if initial_plan.get("metric_definition"):
+            st.caption(f"指标口径：{initial_plan['metric_definition']}")
+        if initial_plan.get("decomposition"):
+            st.caption(f"拆解路径：{initial_plan['decomposition']}")
+        status_labels = {"pending": "待执行", "completed": "已完成", "skipped": "已跳过", "failed": "失败", "superseded": "已改选"}
+        for step in result.get("plan_steps") or initial_plan.get("steps") or []:
+            status = status_labels.get(step.get("status", "pending"), "待执行")
+            st.markdown(f"- {step.get('id')}: {step.get('question')} ({status})")
+        for limitation in initial_plan.get("limitations") or []:
+            st.caption(f"数据限制：{limitation}")
+
     trace = result.get("analysis_trace") or []
     if trace:
         with st.expander("🧠 Analyzer 决策轨迹", expanded=False):
@@ -45,7 +73,16 @@ def render_result(result: Dict[str, Any], steps: List[str]) -> None:
                     f"{decision.get('rationale', '')}"
                 )
                 if followup:
+                    gain = decision.get("information_gain")
+                    if gain is not None:
+                        st.caption(f"相对信息增益：{gain}/5")
                     st.markdown(f"下一步查询：{followup}")
+                for candidate in decision.get("considered_candidates") or []:
+                    if not candidate.get("selected"):
+                        st.caption(
+                            f"未选：{candidate.get('question')}；"
+                            f"{candidate.get('reason', '信息增益较低')}"
+                        )
 
     evidence = result.get("analysis_evidence") or []
     display_rows = result.get("query_result")
@@ -102,7 +139,15 @@ def render_result(result: Dict[str, Any], steps: List[str]) -> None:
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ 配置")
+    st.caption(f"供应商：{LLM_PROVIDER}")
     st.caption(f"模型：`{LLM_MODEL}`")
+    if LLM_PROVIDER == "glm":
+        if LLM_API_KEY and LLM_FALLBACK_API_KEY:
+            st.caption(f"自动回退：DeepSeek / {LLM_FALLBACK_MODEL}")
+        elif LLM_FALLBACK_API_KEY:
+            st.warning("未配置 GLM Key，当前仅使用 DeepSeek")
+        elif LLM_API_KEY:
+            st.caption("未配置 DeepSeek Key，自动回退不可用")
     st.caption(f"接口：`{LLM_BASE_URL}`")
     st.caption(f"数据库：`{DB_PATH}`")
     st.divider()
@@ -115,7 +160,7 @@ with st.sidebar:
 # 主界面
 # ---------------------------------------------------------------------------
 st.title("🛢️ LangGraph SQL Agent")
-st.caption("用自然语言查询数据库，自动完成 意图识别 → Schema 检索 → SQL 生成 → SQL 语义审查 → 执行 → 结果质检 → Analyzer 自主下钻 → 多轮归因 → 可视化 → 回答")
+st.caption("用自然语言查询数据库，自动完成 意图识别 → Schema 检索 → 问题分类与分析规划 → SQL 审查与执行 → 结果质检 → 按证据下钻 → 总结")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -125,8 +170,8 @@ for m in st.session_state.messages:
         st.markdown(m["content"])
 
 if prompt := st.chat_input("输入你的问题，例如：2024 年每月销售额是多少？"):
-    if not LLM_API_KEY:
-        st.error("未检测到 API Key。请复制 `.env.example` 为 `.env` 并填入 `DEEPSEEK_API_KEY`。")
+    if not LLM_AVAILABLE:
+        st.error(f"未检测到 API Key。请配置 {LLM_KEY_HINT} 或 DEEPSEEK_API_KEY。")
     else:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):

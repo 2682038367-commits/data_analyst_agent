@@ -7,7 +7,9 @@
 ## 核心工作流
 
 ~~~
-用户问题 → 核心指标 SQL → SQL Reviewer → 执行 → Result Validator
+用户问题 → 意图识别 → Schema 检索 → 问题分类与分析计划
+                                          ↓
+                              计划第一步 → SQL Reviewer → 执行 → Result Validator
                               ↑                         │
                               └──── 异常修复重试 ──────┘
                                                         ↓
@@ -29,14 +31,16 @@ SQL 审查分三层：
 
 执行后还有一道两层 **Result Validator**：先用确定性规则检查空结果、异常行数、比率/留存率范围、负金额、总量与分组加总、重复记录，再由 LLM 结合问题复核结果粒度、时间窗口与业务量级。发现异常时会把结构化报告反馈给 SQL 生成节点自动修复，并保留每次异常 SQL 的回溯历史。
 
-工作流新增 plan_analysis 和 abandon_followup：前者根据证据决定是否继续下钻，后者在后续查询重试耗尽时保留已有证据做降级总结。
+工作流先由 create_analysis_plan 将问题分类并生成有序查询步骤。每轮结果通过质检后，plan_analysis 先判断证据是否足够；不足时让 Analyzer 给出最多 3 个候选下钻问题及 1～5 的相对信息增益，选择分数最高且不重复、字段可用的方向。新证据可使原计划步骤被改选或提前停止。信息增益是模型给出的相对优先级，不是统计学估计；最终结论仍需由实际 SQL 结果支撑。后续查询失败时，用已取得的证据降级总结。
 
 ## 特性
 
+- ✅ 默认 GLM 主模型、DeepSeek 运行时故障切换；仅配置一方 Key 时仍可运行
 - ✅ 完整的 Agent workflow（不是把 prompt 一次性丢给 LLM）
+- ✅ 查询前分析规划：先分类、确定指标口径和拆解路径，再执行第一条 SQL
 - ✅ 自主归因分析：从核心指标出发，自动拆指标、提出下一问题并继续查询
-- ✅ 多轮证据链：每轮问题、SQL、结果和 Analyzer 决策均可审计
-- ✅ 防失控机制：去重追问、限制深挖轮数，后续失败时用已有证据降级总结
+- ✅ 多轮证据链：每轮问题、SQL、结果、候选取舍与 Analyzer 决策均可审计
+- ✅ 防失控机制：去重追问、拦截缺字段候选、默认最多深挖 3 轮（可配置 0～5），后续失败时用已有证据降级总结
 - ✅ SQL 语义审查：执行前发现「COUNT 该去重却没用 DISTINCT」等业务口径错误
 - ✅ SQL 安全校验 + 编译校验：只允许单条 `SELECT`，表 / 列 / 语法错误确定性拦截
 - ✅ 执行结果质检：成功执行后再次校验结果合理性
@@ -108,13 +112,21 @@ pip install -r requirements.txt
 
 ### 2. 配置 API Key
 
-```bash
+~~~bash
 cp .env.example .env
-# 编辑 .env，填入 DEEPSEEK_API_KEY
-```
+~~~
 
-默认使用 DeepSeek（OpenAI 兼容接口），也可以换成 OpenAI / 其他兼容服务，修改 `.env` 中的
-`LLM_BASE_URL` 和 `LLM_MODEL` 即可。
+默认以 GLM 为主模型，DeepSeek 为自动 fallback。在 .env 中填入：
+
+~~~ini
+LLM_PROVIDER=glm
+GLM_API_KEY=你的智谱API_Key
+DEEPSEEK_API_KEY=你的DeepSeek_API_Key
+~~~
+
+也可用 ZAI_API_KEY 代替 GLM_API_KEY。每次模型请求先调用 GLM；请求抛错时自动以相同输入调用 DeepSeek。只配置 GLM Key 时不会自动回退；只配置 DeepSeek Key 时会直接使用 DeepSeek。GLM_MODEL / GLM_BASE_URL 与 DEEPSEEK_MODEL / DEEPSEEK_BASE_URL 可分别覆盖默认值，互不混用。[智谱官方 LangChain 接入说明](https://docs.bigmodel.cn/cn/guide/develop/langchain/introduction)
+
+如需仅使用 DeepSeek 或其他 OpenAI 兼容服务，可设 LLM_PROVIDER=deepseek，并继续使用原有 LLM_BASE_URL、LLM_MODEL 配置。
 
 ### 3. 启动
 

@@ -1,9 +1,9 @@
 """LangGraph SQL Agent 的核心工作流。
 
 流程：
-    用户问题 → 核心 SQL → SQL Reviewer → 执行 → Result Validator
-        → Analyzer 判断证据是否充足
-        →（需要深挖）提出下一问题 → SQL Reviewer → 执行 → Result Validator
+    用户问题 → 问题分类与初始计划 → 核心 SQL → SQL Reviewer → 执行 → Result Validator
+        → Analyzer 判断证据是否充足并比较候选下钻方向
+        →（需要深挖）选择下一问题 → SQL Reviewer → 执行 → Result Validator
         →（证据充足或达到上限）多轮证据归因 → 可视化 → 回答
 
 每一轮 SQL 都经过安全、编译、语义和结果合理性检查；后续查询失败时，
@@ -12,11 +12,14 @@
 
 import json
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Tuple
+from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
@@ -24,6 +27,10 @@ from . import prompts
 from .config import (
     LLM_API_KEY,
     LLM_BASE_URL,
+    LLM_FALLBACK_API_KEY,
+    LLM_FALLBACK_BASE_URL,
+    LLM_FALLBACK_MODEL,
+    LLM_KEY_HINT,
     LLM_MODEL,
     LLM_PROXY,
     LLM_TEMPERATURE,
@@ -33,9 +40,12 @@ from .config import (
 )
 from .analysis_workflow import (
     active_question,
+    complete_plan_step,
     format_evidence,
     needs_broad_schema,
-    normalize_analysis_plan,
+    next_plan_step,
+    choose_drilldown,
+    normalize_initial_plan,
     snapshot_evidence,
 )
 from .db import get_connection, get_relevant_schema, list_tables
@@ -52,7 +62,7 @@ def _build_http_clients():
 
     很多开发机配置了 socks 代理（如 Clash 的 socks://127.0.0.1:7897），
     但 httpx/openai 客户端不支持 socks 协议，会导致 ChatOpenAI 初始化失败。
-    DeepSeek 国内直连无需代理，因此默认 trust_env=False 忽略环境代理；
+    当前模型服务可按需直连，因此默认 trust_env=False 忽略环境代理；
     如需代理，在 .env 里配置 LLM_PROXY=http://... 即可。
     """
     if LLM_PROXY:
@@ -64,16 +74,36 @@ def _build_http_clients():
     return client, async_client
 
 
-def _get_llm(model: str | None = None) -> ChatOpenAI:
+def _get_llm(model: str | None = None) -> Runnable:
+    """优先 GLM；调用异常时以相同消息自动重试 DeepSeek。"""
+    if not LLM_API_KEY and not LLM_FALLBACK_API_KEY:
+        raise RuntimeError(
+            f"未配置模型 API Key：请设置 {LLM_KEY_HINT} 或 DEEPSEEK_API_KEY"
+        )
     http_client, http_async_client = _build_http_clients()
-    return ChatOpenAI(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
-        model=model or LLM_MODEL,
-        temperature=LLM_TEMPERATURE,
-        http_client=http_client,
-        http_async_client=http_async_client,
-        http_socket_options=(),
+
+    def build_client(api_key: str, base_url: str, model_name: str) -> ChatOpenAI:
+        return ChatOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            model=model_name,
+            temperature=LLM_TEMPERATURE,
+            http_client=http_client,
+            http_async_client=http_async_client,
+            http_socket_options=(),
+        )
+
+    if LLM_API_KEY:
+        primary = build_client(LLM_API_KEY, LLM_BASE_URL, model or LLM_MODEL)
+        if LLM_FALLBACK_API_KEY:
+            secondary = build_client(
+                LLM_FALLBACK_API_KEY, LLM_FALLBACK_BASE_URL, LLM_FALLBACK_MODEL
+            )
+            return primary.with_fallbacks([secondary])
+        return primary
+    return build_client(
+        LLM_FALLBACK_API_KEY, LLM_FALLBACK_BASE_URL,
+        model or LLM_FALLBACK_MODEL,
     )
 
 
@@ -174,6 +204,33 @@ def retrieve_schema(state: AgentState) -> Dict[str, Any]:
     return {"schema": schema, "tables": tables}
 
 
+def create_analysis_plan(state: AgentState) -> Dict[str, Any]:
+    """查询前分类并规划可执行步骤；解析失败时退化为单步核心查询。"""
+    prompt = prompts.INITIAL_PLAN_TEMPLATE.format(
+        today=datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat(),
+        question=state["question"],
+        schema=state.get("schema", ""),
+        max_steps=MAX_ANALYSIS_DEPTH + 1,
+    )
+    llm = _get_llm()
+    resp = llm.invoke([
+        SystemMessage(content=prompts.INITIAL_PLAN_SYSTEM),
+        HumanMessage(content=prompt),
+    ])
+    text = resp.content if isinstance(resp.content, str) else str(resp.content)
+    plan = normalize_initial_plan(
+        _parse_json_object(text),
+        question=state["question"],
+        max_followups=MAX_ANALYSIS_DEPTH,
+        schema=state.get("schema", ""),
+    )
+    return {
+        "initial_plan": plan,
+        "plan_steps": plan["steps"],
+        "followup_question": plan["steps"][0]["question"],
+    }
+
+
 def generate_sql(state: AgentState) -> Dict[str, Any]:
     """节点 3：为核心问题或 Analyzer 追问生成 SQL。"""
     feedback = ""
@@ -186,6 +243,7 @@ def generate_sql(state: AgentState) -> Dict[str, Any]:
     prompt = prompts.GENERATE_SQL_TEMPLATE.format(
         schema=state.get("schema", ""),
         original_question=state["question"],
+        initial_plan=json.dumps(state.get("initial_plan") or {}, ensure_ascii=False),
         question=current_question,
         analysis_context=format_evidence(state.get("analysis_evidence") or []),
         error_feedback=feedback,
@@ -337,6 +395,8 @@ def plan_analysis(state: AgentState) -> Dict[str, Any]:
     depth = state.get("analysis_depth", 0)
     current_question = active_question(state)
     evidence = list(state.get("analysis_evidence") or [])
+    steps = complete_plan_step(state.get("plan_steps") or [], current_question)
+    pending_step = next_plan_step(steps)
     evidence.append(snapshot_evidence(
         question=current_question,
         sql=state.get("sql_query", ""),
@@ -352,6 +412,11 @@ def plan_analysis(state: AgentState) -> Dict[str, Any]:
             schema=state.get("schema", ""),
             depth=depth,
             max_depth=MAX_ANALYSIS_DEPTH,
+            initial_plan=json.dumps(
+                {**(state.get("initial_plan") or {}), "steps": steps},
+                ensure_ascii=False,
+            ),
+            next_step=json.dumps(pending_step or {}, ensure_ascii=False),
             evidence=format_evidence(evidence),
         )
         llm = _get_llm()
@@ -362,13 +427,33 @@ def plan_analysis(state: AgentState) -> Dict[str, Any]:
         text = resp.content if isinstance(resp.content, str) else str(resp.content)
         raw_plan = _parse_json_object(text)
 
-    plan = normalize_analysis_plan(
+    plan = choose_drilldown(
         raw_plan,
         original_question=state["question"],
         evidence=evidence,
         depth=depth,
         max_depth=MAX_ANALYSIS_DEPTH,
+        schema=state.get("schema", ""),
+        pending_step=pending_step,
     )
+    if plan["needs_followup"]:
+        followup = plan["followup_question"]
+        if pending_step and pending_step["question"] != followup:
+            for step in steps:
+                if step["id"] == pending_step["id"]:
+                    step["status"] = "superseded"
+                    break
+        if not any(step.get("question") == followup for step in steps):
+            steps.append({
+                "id": f"step_{len(steps) + 1}",
+                "question": followup,
+                "purpose": plan.get("expected_insight", ""),
+                "status": "pending",
+            })
+    else:
+        for step in steps:
+            if step.get("status") == "pending":
+                step["status"] = "skipped"
     trace = list(state.get("analysis_trace") or [])
     trace.append({
         "round": depth + 1,
@@ -377,6 +462,7 @@ def plan_analysis(state: AgentState) -> Dict[str, Any]:
     })
 
     updates: Dict[str, Any] = {
+        "plan_steps": steps,
         "analysis_evidence": evidence,
         "analysis_plan": plan,
         "analysis_trace": trace,
@@ -410,7 +496,13 @@ def abandon_followup(state: AgentState) -> Dict[str, Any]:
         "analysis_type": "query_failure_fallback",
         "expected_insight": "",
     })
+    steps = [dict(step) for step in state.get("plan_steps") or []]
+    for step in steps:
+        if step.get("question") == active_question(state) and step.get("status") == "pending":
+            step["status"] = "failed"
+            break
     return {
+        "plan_steps": steps,
         "followup_question": None,
         "analysis_plan": {
             "needs_followup": False,
@@ -435,6 +527,10 @@ def analyze(state: AgentState) -> Dict[str, Any]:
         ))
     prompt = prompts.ANALYZE_TEMPLATE.format(
         question=state["question"],
+        initial_plan=json.dumps(
+            {**(state.get("initial_plan") or {}), "steps": state.get("plan_steps") or []},
+            ensure_ascii=False,
+        ),
         analysis_trace=json.dumps(state.get("analysis_trace") or [], ensure_ascii=False),
         evidence=format_evidence(evidence, row_limit=50),
     )
@@ -527,6 +623,7 @@ def build_graph():
     g.add_node("classify_intent", classify_intent)
     g.add_node("direct_answer", direct_answer)
     g.add_node("retrieve_schema", retrieve_schema)
+    g.add_node("create_analysis_plan", create_analysis_plan)
     g.add_node("generate_sql", generate_sql)
     g.add_node("review_sql", review_sql)
     g.add_node("execute_sql", execute_sql)
@@ -546,7 +643,8 @@ def build_graph():
     )
     g.add_edge("direct_answer", END)
 
-    g.add_edge("retrieve_schema", "generate_sql")
+    g.add_edge("retrieve_schema", "create_analysis_plan")
+    g.add_edge("create_analysis_plan", "generate_sql")
     g.add_edge("generate_sql", "review_sql")
     g.add_conditional_edges(
         "review_sql", route_after_review,
@@ -595,7 +693,11 @@ def run_agent(question: str) -> Tuple[AgentState, List[str]]:
     initial = default_state(question)
     state = dict(initial)
     steps: List[str] = []
-    for chunk in _graph.stream(initial, stream_mode="updates"):
+    for chunk in _graph.stream(
+        initial,
+        stream_mode="updates",
+        config={"recursion_limit": 25 + (MAX_ANALYSIS_DEPTH + 1) * (MAX_RETRIES + 5)},
+    ):
         for node, update in chunk.items():
             steps.append(node)
             if update:

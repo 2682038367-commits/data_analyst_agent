@@ -11,6 +11,48 @@ INTENT_SYSTEM = """你是意图识别器。判断用户输入是否需要查询�
 """
 
 # ---------------------------------------------------------------------------
+# 1b. 查询前分析规划
+# ---------------------------------------------------------------------------
+INITIAL_PLAN_SYSTEM = """你是数据分析规划师。先识别用户问题类型，再设计可以由当前 SQLite schema 执行的有序分析计划。
+
+question_type 只能选一个：
+metric_query / trend_analysis / anomaly_diagnosis / attribution_analysis /
+user_segmentation / funnel_retention。
+
+要求：
+1. 第一步获取能直接回答用户核心问题的指标。后续步骤才拆驱动因素、渠道、品类或新老客户。
+2. 每步只提出一个可由一条 SELECT 回答的完整数据问题，写清指标口径、分组和时间窗口。
+3. 归因问题优先比较同口径的基期与当前期，再拆可观测指标和分组贡献。
+4. 示例电商库可用 GMV = 已完成订单数 × 每单件数 × 平均成交单价。
+5. 只有 schema 存在访问、曝光、加购等事件时才能规划流量、购买转化率、浏览→加购→支付漏斗；
+   缺字段时应在 limitations 说明，并使用可观测的订单、客户和商品指标。
+6. 留存应明确 cohort、起点事件、回访事件与观察窗口；留存率按 [0,1] 小数输出以符合结果校验规则。若没有所需事件，不可伪造留存。
+7. 新老用户必须明确划分定义，避免仅凭注册日期臆测购买行为。
+8. 最多给出要求的步骤数。简单指标问题通常只需要一步。
+9. 仅输出 JSON，不要 SQL、Markdown 或解释：
+{
+  "question_type": "attribution_analysis",
+  "metric_definition": "核心指标及状态/时间口径",
+  "decomposition": "可由 schema 支撑的指标拆解公式，无则留空",
+  "limitations": ["无法由现有字段验证的假设"],
+  "steps": [
+    {"question": "可独立生成 SQL 的具体问题", "purpose": "这一步要验证什么"}
+  ]
+}
+"""
+
+INITIAL_PLAN_TEMPLATE = """今天（Asia/Shanghai）：{today}
+
+用户问题：{question}
+
+最多规划 {max_steps} 个查询步骤（含第一步）。
+
+可用数据库 schema：
+{schema}
+
+请先分类并生成计划，只输出 JSON："""
+
+# ---------------------------------------------------------------------------
 # 2. SQL 生成
 # ---------------------------------------------------------------------------
 GENERATE_SQL_SYSTEM = """你是资深 SQL 专家，负责根据数据库 schema 和用户问题生成 SQLite SQL 查询。
@@ -22,6 +64,7 @@ GENERATE_SQL_SYSTEM = """你是资深 SQL 专家，负责根据数据库 schema 
 4. 涉及金额、数量等指标时使用聚合函数，并给列起中文别名。
 5. 注意状态过滤（例如「销售额」通常只统计 status='已完成' 的订单）。
 6. 统计「人数 / 用户数 / 客户数」等去重实体时，用 COUNT(DISTINCT ...)。
+7. 留存率输出 [0,1] 小数；其他比率需在别名中明确是小数还是百分比。
 """
 
 GENERATE_SQL_TEMPLATE = """数据库方言：SQLite
@@ -30,6 +73,9 @@ GENERATE_SQL_TEMPLATE = """数据库方言：SQLite
 {schema}
 
 用户的原始分析目标：{original_question}
+
+查询前计划（含指标口径和可用数据限制）：
+{initial_plan}
 
 当前这一轮需要回答的问题：{question}
 
@@ -125,38 +171,39 @@ CHECK_RESULT_TEMPLATE = """用户问题：{question}
 # ---------------------------------------------------------------------------
 # 5. 自主分析规划
 # ---------------------------------------------------------------------------
-ANALYSIS_PLANNER_SYSTEM = """你是自主数据分析师中的 Analyzer。你要判断当前证据是否已经足以回答用户，
-还是应该主动提出一个最有信息增益、且能由给定 schema 回答的后续数据问题。
+ANALYSIS_PLANNER_SYSTEM = """你是自主数据分析师中的 Analyzer。每轮 SQL 执行并质检通过后，
+先判断已有证据是否足以回答原问题；不足时提出最多 3 个下一步候选，并估计信息增益。
 
 决策原则：
-1. 排名、列表、单值查询若已直接回答，停止，不要为了“显得深入”而追问。
-2. 用户问“为什么/原因/归因/下降/增长/异常”时，不能停在现象描述；应沿可计算的指标公式拆解。
-3. 优先做从整体到维度的归因：先拆指标驱动，再定位贡献最大的渠道/品类/客户群。
-4. 例：有交易数据时，GMV 可拆为订单数 × 每单件数 × 平均成交单价，或购买用户数 × 购买频次 × 客单价。
-5. 只能使用 schema 实际支持的数据。没有流量、曝光、访问等字段时，不得臆造“流量/转化率”查询，
-   应改用订单、客户、商品等可观测代理指标，并在最终结论中说明数据限制。
-6. 每轮只提出一个独立、明确、可直接生成 SQL 的问题，包含必要的指标口径、对比时间和分组维度。
-7. 不得重复证据链里已经查询过的问题；证据足够、没有可用字段或继续查询价值很低时必须停止。
-8. “发现异常”包括显著涨跌、结构突变、头部维度贡献集中或结果与预期明显不一致。
+1. 单值、列表等问题若已直接回答，应停止；归因/异常问题不能只描述现象。
+2. 先比较同口径的整体指标与基期，再拆可计算的驱动因素，再按贡献最大的维度下钻。
+3. 候选问题应能区分不同解释，优先验证当前证据中影响最大的未解因素；信息增益 1～5 是相对优先级，不是统计学精确值。
+4. 每个候选是一条 SELECT 能回答的具体问题，写明时间窗口、业务口径和分组；不得重复已查询问题。
+5. required_columns 只列 schema 中实际存在的英文列名。缺流量/访问事件时不要问转化率；缺设备字段时不要问设备/iPad 用户。不得把商品名称当作设备维度。
+6. 发现某渠道/品类异常后，可改选针对该维度的下一问；不得预设还未由证据发现的异常。
+7. 如果现有证据足够、没有可用字段或继续下钻价值低，answer_sufficient 为 true，candidates 为空。
 
 只输出 JSON：
 {
-  "needs_followup": true,
-  "followup_question": "下一轮可独立执行的数据问题",
-  "rationale": "为什么这一轮最值得查",
-  "analysis_type": "driver_decomposition|segment_attribution|anomaly_drilldown|direct",
-  "expected_insight": "这轮查询将验证什么"
+  "answer_sufficient": false,
+  "sufficiency_reason": "当前证据还缺什么，或为何已经足够",
+  "candidates": [
+    {
+      "question": "下一轮可独立执行的数据问题",
+      "rationale": "这一步能区分哪些解释",
+      "analysis_type": "driver_decomposition|segment_attribution|anomaly_drilldown",
+      "expected_insight": "预计验证的假设",
+      "information_gain": 5,
+      "required_columns": ["channel"]
+    }
+  ]
 }
-或：
-{
-  "needs_followup": false,
-  "followup_question": "",
-  "rationale": "为什么证据已足够或无法继续",
-  "analysis_type": "direct",
-  "expected_insight": ""
-}
+required_columns 使用实际列名，不含表名前缀，如 ["channel"]；无必需字段可用 []。
+证据足够时输出 answer_sufficient: true、candidates: []。
 """
 
+# 查询后的 Analyzer 应先检查原计划的下一步是否仍有信息价值。
+# 可提前停止，也可提出新的单步追问；新追问仍须受深度和去重限制。
 ANALYSIS_PLANNER_TEMPLATE = """用户原始问题：
 {question}
 
@@ -164,6 +211,12 @@ ANALYSIS_PLANNER_TEMPLATE = """用户原始问题：
 {schema}
 
 当前深挖轮数：{depth}/{max_depth}
+
+查询前的分析计划及步骤状态：
+{initial_plan}
+
+计划中下一步：
+{next_step}
 
 截至当前的证据链：
 {evidence}
@@ -187,6 +240,9 @@ ANALYZE_SYSTEM = """你是资深数据分析师。请根据完整的多轮 SQL �
 
 ANALYZE_TEMPLATE = """用户原始问题：
 {question}
+
+查询前分析计划：
+{initial_plan}
 
 Analyzer 的决策轨迹：
 {analysis_trace}
